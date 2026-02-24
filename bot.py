@@ -1,847 +1,1087 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
+import re
+import asyncio
+import shutil
 import logging
 import random
-import sqlite3
-import html
-from functools import wraps
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple, List
+
 from dotenv import load_dotenv
-from pathlib import Path
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
+from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes,
-    filters, CallbackQueryHandler
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
+
+from db import Database, default_price_for_rarity
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip()]
-DB_PATH = os.getenv("DATABASE","bot_data.db")
-CARD_DIR = os.getenv("CARD_IMAGES_DIR","card_images")
 
-Path(CARD_DIR).mkdir(parents=True, exist_ok=True)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+DB_PATH = os.getenv("DB_PATH", "./data/bot.sqlite3").strip()
+START_COINS = int(os.getenv("START_COINS", "200"))
+DAILY_MIN = int(os.getenv("DAILY_MIN", "80"))
+DAILY_MAX = int(os.getenv("DAILY_MAX", "160"))
+DEFAULT_DROP_EVERY = int(os.getenv("DEFAULT_DROP_EVERY", "0"))
+
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN is missing in .env")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("card-bot")
 
-# Rarity emojis
-RARITY_EMOJI = {
-    "Common":"🟤",
-    "Rare":"🟡",
-    "Epic":"🔮",
-    "Legendary":"⚡",
-    "Mythic":"👑"
-}
+db = Database(DB_PATH)
 
-# --- Database helpers ---
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+SHOP_STATE = {}  # user_id -> card_id
 
-conn = db_connect()
-cur = conn.cursor()
 
-def init_db():
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        tg_id INTEGER UNIQUE,
-        username TEXT,
-        coins INTEGER DEFAULT 10000,
-        daily_claimed INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS cards (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        movie TEXT,
-        rarity TEXT,
-        image TEXT
-    );
-    CREATE TABLE IF NOT EXISTS user_cards (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        card_id INTEGER,
-        is_fav INTEGER DEFAULT 0,
-        FOREIGN KEY(user_id) REFERENCES users(id),
-        FOREIGN KEY(card_id) REFERENCES cards(id)
-    );
-    CREATE TABLE IF NOT EXISTS drops (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id INTEGER,
-        card_id INTEGER,
-        claimed INTEGER DEFAULT 0,
-        answer TEXT
-    );
-    CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY,
-        drop_every INTEGER DEFAULT 0,
-        msg_count INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS evotes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id INTEGER,
-        name TEXT,
-        votes INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS sudo_list (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tg_id INTEGER UNIQUE
-    );
-    """)
-    conn.commit()
+# ---------------- Helpers ----------------
+def mention_html(user) -> str:
+    name = (user.full_name or "User").replace("<", "").replace(">", "")
+    return f"<a href='tg://user?id={user.id}'>{name}</a>"
 
-init_db()
+def clean_name(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
-# --- Utilities ---
-def is_admin(user_id: int):
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def is_sudo(user_id: int):
-    cur.execute("SELECT 1 FROM sudo_list WHERE tg_id=?", (user_id,))
-    return cur.fetchone() is not None or is_admin(user_id)
+async def is_sudo_or_admin(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    return await db.is_sudo(user_id)
 
-def ensure_user(tg_user):
-    cur.execute("SELECT * FROM users WHERE tg_id=?", (tg_user.id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute(
-            "INSERT INTO users (tg_id, username, coins) VALUES (?, ?, ?)",
-            (tg_user.id, tg_user.username or "", 10000)
-        )
-        conn.commit()
-        cur.execute("SELECT * FROM users WHERE tg_id=?", (tg_user.id,))
-        row = cur.fetchone()
-    return row
+def require_group(update: Update) -> bool:
+    return update.effective_chat and update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not is_admin(user_id):
-            await update.message.reply_text("Admin commands only.")
+def parse_target_user_and_amount(update: Update, args: List[str]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Accept patterns:
+      - reply + amount: /givecoin 100
+      - explicit id + amount: /givecoin 123456 100
+    """
+    target_id = None
+    amount = None
+
+    if update.message and update.message.reply_to_message and len(args) == 1:
+        target_id = update.message.reply_to_message.from_user.id
+        amount = int(args[0])
+        return target_id, amount
+
+    if len(args) >= 2:
+        target_id = int(args[0])
+        amount = int(args[1])
+        return target_id, amount
+
+    return None, None
+
+async def ensure_user(update: Update):
+    u = update.effective_user
+    await db.upsert_user(u.id, u.username or "", u.first_name or "", START_COINS)
+
+async def ensure_group_known(update: Update):
+    chat = update.effective_chat
+    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await db.upsert_group(chat.id, chat.title or "Group")
+
+def fmt_card_line(card: dict, own_idx: int, total_cards: int) -> str:
+    # [Movie name + (own:[2/25]) + Card ID + rarity emoji + character name]
+    return f"🎬 <b>{card['movie']}</b>  (own:[{own_idx}/{total_cards}])\n🆔 <code>{card['id']}</code>  {card['rarity_emoji']} <b>{card['name']}</b>"
+
+def harem_keyboard(page: int, pages: int):
+    btns = []
+    row = []
+    if page > 1:
+        row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"harem:{page-1}"))
+    row.append(InlineKeyboardButton(f"📄 {page}/{pages}", callback_data="noop"))
+    if page < pages:
+        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"harem:{page+1}"))
+    btns.append(row)
+    btns.append([InlineKeyboardButton("⭐ Set Fav (use /set <id>)", callback_data="noop")])
+    return InlineKeyboardMarkup(btns)
+
+def tops_keyboard(active: str = "coins"):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🪙 Top Coins", callback_data="tops:coins"),
+            InlineKeyboardButton("🃏 Top Cards", callback_data="tops:cards"),
+        ],
+        [InlineKeyboardButton(f"✅ Showing: {active}", callback_data="noop")]
+    ])
+
+def shop_keyboard(card_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🛒 Buy", callback_data=f"shop:buy:{card_id}"),
+            InlineKeyboardButton("⏭️ Next", callback_data="shop:next"),
+        ]
+    ])
+
+def vote_keyboard(options: List[dict]):
+    rows = []
+    for opt in options:
+        rows.append([InlineKeyboardButton(f"🗳️ {opt['name']}", callback_data=f"vote:{opt['option_id']}")])
+    rows.append([InlineKeyboardButton("📊 Results", callback_data="vote:results")])
+    return InlineKeyboardMarkup(rows)
+
+async def render_vote_status(chat_id: int, user_id: int) -> str:
+    results = await db.vote_results(chat_id)
+    total = sum(r["votes"] for r in results) if results else 0
+    uv = await db.user_vote(chat_id, user_id)
+
+    lines = ["<b>📊 Vote Results</b>"]
+    for r in results:
+        mark = "✅" if uv == r["option_id"] else "▫️"
+        lines.append(f"{mark} <b>{r['name']}</b> — <code>{r['votes']}</code>")
+    lines.append(f"\n👥 Total Votes: <b>{total}</b>")
+    if uv:
+        chosen = next((x["name"] for x in results if x["option_id"] == uv), None)
+        if chosen:
+            lines.append(f"🧾 You voted: <b>{chosen}</b>")
+    return "\n".join(lines)
+
+
+# ---------------- User Commands ----------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    text = (
+        "🎴 <b>Character Collection Game</b>\n"
+        "စုဆောင်း၊ ကစား၊ ဝယ်ယူ၊ Top အောင်မြင်သူဖြစ်လာပါ!\n\n"
+        "Rarity System:\n"
+        "🟤Common | 🟡Rare | 🔮Epic | ⚡Legendary | 👑Mythic\n\n"
+        "👉 Commands ကြည့်ရန်: /helps\n\n"
+        "<i>Create by : @Enoch_777</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def helps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+    text = (
+        "📌 <b>User Commands</b>\n\n"
+        "🚀 /start - စတင်အသုံးပြုရန်\n"
+        "🧾 /helps - commands များ\n"
+        "🗂️ /harem - သင့် cards collection (5 cards/page)\n"
+        "⭐ /set &lt;card id&gt; - fav character သတ်မှတ်\n\n"
+        "🟩 /slime &lt;character name&gt; - drop ကဒ်ကို နာမည်မှန်ရေးပြီးယူ\n\n"
+        "🎰 /slots &lt;amount&gt; - bet game (2×/3×)\n"
+        "🏀 /basket &lt;amount&gt; - bet game (2×/3×)\n\n"
+        "🪙 /balance - coin လက်ကျန်\n"
+        "🎁 /daily - နေ့စဉ် bonus\n"
+        "🛍️ /shop - character ဝယ်ယူ\n"
+        "🏆 /tops - Top 10 (coins/cards)\n\n"
+        "🤝 /givecoin &lt;reply or id&gt; &lt;amount&gt; - coin လွဲပေး\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
+        return
+
+    text = (
+        "🛠️ <b>Admin / Sudo Commands</b>\n\n"
+        "📤 /upload (reply photo) rarity | movie | name | price(optional)\n"
+        "⏱️ /setdrop &lt;number&gt; - group drop message count\n"
+        "🎁 /gift coin &lt;amount&gt; &lt;reply or id&gt;\n"
+        "🎁 /gift card &lt;amount&gt; &lt;reply or id&gt;  (random)\n\n"
+        "📣 /broadcast (reply text/photo) OR /broadcast your text\n"
+        "📊 /stats - users & groups list summary\n"
+        "💾 /backup - db backup\n"
+        "♻️ /restore (reply db file) - restore db\n"
+        "🧨 /allclear - delete all data\n"
+        "🗑️ /delete &lt;card id&gt; - delete one card\n\n"
+        "👑 /addsudo &lt;reply or id&gt; - add sudo\n"
+        "📜 /sudolist - list sudo\n\n"
+        "🗳️ /evote name1 | name2 | name3 - set vote options (group)\n"
+        "✅ /vote - vote buttons\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    user = await db.get_user(update.effective_user.id)
+    await update.message.reply_text(f"🪙 <b>Your Balance</b>\nCoins: <code>{user['coins']}</code>", parse_mode=ParseMode.HTML)
+
+async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    u = await db.get_user(update.effective_user.id)
+    last = u.get("last_daily")
+
+    now = datetime.now(timezone.utc)
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except Exception:
+            last_dt = None
+        if last_dt and (now - last_dt) < timedelta(hours=24):
+            remain = timedelta(hours=24) - (now - last_dt)
+            hh = int(remain.total_seconds() // 3600)
+            mm = int((remain.total_seconds() % 3600) // 60)
+            await update.message.reply_text(f"⏳ Daily bonus ကို နောက်ထပ် <b>{hh}h {mm}m</b> နောက်မှ ယူနိုင်ပါမယ်။", parse_mode=ParseMode.HTML)
             return
-        return await func(update, context)
-    return wrapper
 
-# --- Commands ---
+    bonus = random.randint(DAILY_MIN, DAILY_MAX)
+    await db.add_coins(update.effective_user.id, bonus)
+    await db.set_last_daily(update.effective_user.id, now.isoformat())
+    await update.message.reply_text(f"🎁 <b>Daily Bonus</b>\nYou got: <code>+{bonus}</code> coins!", parse_mode=ParseMode.HTML)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    text = (
-        f"မင်္ဂလာပါ {user.first_name} 👋\n\n"
-        "Character Collection Game Bot မှကြိုဆိုပါတယ်။\n\n"
-        "Commands များကို /helps မှာကြည့်ပါ။\n\n"
-        "Create by : @Enoch_777"
-    )
-    await update.message.reply_text(text)
-
-async def helps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "**User Commands**\n"
-        "/start - စတင်အသုံးပြုခြင်း\n"
-        "/helps - ဒီစာမျက်နှာ\n"
-        "/slime <name> - Drop ကဒ်ကိုယူရန် (group drop မှာ)\n"
-        "/harem - ကိုယ့် collection ကြည့်ရန်\n"
-        "/set <card id> - harem မှာ fav သတ်မှတ်ရန်\n        \n"
-        "/slots <amount> - Slot bet game\n"
-        "/basket <amount> - Basketball bet game\n"
-        "/givecoin <reply or id> <amount> - coin ပေးရန်\n"
-        "/balance - coin balance\n"
-        "/daily - နေ့စဉ် bonus\n"
-        "/shop - ကဒ်ဝယ်ရန်\n"
-        "/tops - top players\n\n"
-        "**Admin Commands**\n"
-        "/upload - ကဒ်တင်ရန် (reply photo with caption: Name | Movie | Rarity)\n"
-        "/setdrop <number> - group drop frequency\n"
-        "/gift coin <amount> <reply or id> - coin ပေးရန်\n"
-        "/gift card <amount> <reply or id> - random card ပေးရန်\n"
-        "/edit - admin commands list\n        \n"
-        "/broadcast - group များသို့ပို့ရန် (reply to photo/text)\n"
-        "/stats - users and groups\n"
-        "/backup - export DB\n"
-        "/restore - restore DB (admin only, manual file replace)\n"
-        "/allclear - data အားလုံးဖျက်ရန်\n"
-        "/delete <card id> - card ဖျက်ရန်\n"
-        "/addsudo <reply or id> - sudo add\n"
-        "/sudolist - sudo list\n"
-        "/evote - create election (admin in group)\n"
-        "/vote - vote via buttons\n\n"
-        "Rarity: 🟤Common | 🟡Rare | 🔮Epic | ⚡Legendary | 👑Mythic"
-    )
-    await update.message.reply_text(text)
-
-# --- Upload card (admin) ---
-@admin_only
-async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    # Expect reply with photo and caption "Name | Movie | Rarity"
-    if not msg.reply_to_message or not msg.reply_to_message.photo:
-        await msg.reply_text("Upload လုပ်ရန်: reply to a photo with caption: Name | Movie | Rarity")
+async def givecoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    args = context.args
+    try:
+        target_id, amount = parse_target_user_and_amount(update, args)
+    except Exception:
+        await update.message.reply_text("အသုံးပြုပုံ: /givecoin <reply or id> <amount>")
         return
-    caption = msg.reply_to_message.caption or ""
-    parts = [p.strip() for p in caption.split("|")]
+
+    if not target_id or not amount or amount <= 0:
+        await update.message.reply_text("အသုံးပြုပုံ: /givecoin <reply or id> <amount>")
+        return
+
+    sender_id = update.effective_user.id
+    if target_id == sender_id:
+        await update.message.reply_text("🫤 ကိုယ့်ကိုကိုယ် coin ပေးလို့မရပါ။")
+        return
+
+    sender = await db.get_user(sender_id)
+    if sender["coins"] < amount:
+        await update.message.reply_text("⛔ Coins မလုံလောက်ပါ။")
+        return
+
+    await db.upsert_user(target_id, "", "User", START_COINS)  # ensure exists
+    await db.add_coins(sender_id, -amount)
+    await db.add_coins(target_id, amount)
+    await update.message.reply_text(
+        f"✅ {mention_html(update.effective_user)} → <code>{target_id}</code>\n🪙 Sent: <b>{amount}</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    if not context.args:
+        await update.message.reply_text("အသုံးပြုပုံ: /set <card id>")
+        return
+    try:
+        card_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Card ID မှန်မှန်ရေးပါ။ ဥပမာ: /set 12")
+        return
+
+    card = await db.get_card(card_id)
+    if not card:
+        await update.message.reply_text("⛔ ဒီ Card ID မရှိပါ။")
+        return
+
+    await db.set_fav(update.effective_user.id, card_id)
+    await update.message.reply_text(f"⭐ Fav set!\n🆔 <code>{card_id}</code> {card['rarity_emoji']} <b>{card['name']}</b>", parse_mode=ParseMode.HTML)
+
+async def harem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    total_cards = await db.count_distinct_cards()
+    page = 1
+    cards, pages = await db.inventory_page(update.effective_user.id, page, page_size=5)
+
+    if not cards:
+        await update.message.reply_text("📭 Harem က kosong ပါသေးတယ်။ Drop ယူပါ သို့မဟုတ် /shop မှာ ဝယ်နိုင်ပါတယ်။")
+        return
+
+    lines = [f"🗂️ <b>{mention_html(update.effective_user)}'s Harem</b>\n"]
+    for idx, c in enumerate(cards, start=1):
+        lines.append(fmt_card_line(c, idx, total_cards))
+        lines.append("")
+
+    await update.message.reply_text(
+        "\n".join(lines).strip(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=harem_keyboard(page, pages),
+        disable_web_page_preview=True,
+    )
+
+async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    card = await db.random_shop_card()
+    if not card:
+        await update.message.reply_text("🛍️ Shop ထဲမှာ card မရှိသေးပါ။ Admin /upload လုပ်ပြီး price ထည့်ပေးရပါမယ်။")
+        return
+
+    SHOP_STATE[update.effective_user.id] = card["id"]
+    txt = (
+        "🛍️ <b>Shop</b>\n\n"
+        f"🎬 <b>{card['movie']}</b>\n"
+        f"🆔 <code>{card['id']}</code>\n"
+        f"{card['rarity_emoji']} <b>{card['rarity']}</b>\n"
+        f"👤 <b>{card['name']}</b>\n\n"
+        f"💰 Price: <code>{card['price']}</code> coins\n"
+        "—\n"
+        "Buy မလုပ်ချင်ရင် Next နှိပ်ပြီး ပြောင်းနိုင်ပါတယ်။"
+    )
+    if card.get("file_id"):
+        await update.message.reply_photo(card["file_id"], caption=txt, parse_mode=ParseMode.HTML, reply_markup=shop_keyboard(card["id"]))
+    else:
+        await update.message.reply_text(txt, parse_mode=ParseMode.HTML, reply_markup=shop_keyboard(card["id"]))
+
+async def tops_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    top = await db.top_coins(10)
+    lines = ["🏆 <b>Top 10 — Coins</b>\n"]
+    for i, r in enumerate(top, start=1):
+        name = r["username"] or r["first_name"] or str(r["user_id"])
+        lines.append(f"{i:02d}. <b>{name}</b> — <code>{r['coins']}</code> 🪙")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=tops_keyboard("coins"))
+
+async def slots_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    if not context.args:
+        await update.message.reply_text("အသုံးပြုပုံ: /slots <amount>")
+        return
+    try:
+        bet = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Bet amount ကို number ဖြင့်ရေးပါ။")
+        return
+    if bet <= 0:
+        await update.message.reply_text("Bet amount > 0 ဖြစ်ရပါမယ်။")
+        return
+
+    u = await db.get_user(update.effective_user.id)
+    if u["coins"] < bet:
+        await update.message.reply_text("⛔ Coins မလုံလောက်ပါ။")
+        return
+
+    symbols = ["🍒", "🍋", "🔔", "💎", "7️⃣"]
+    msg = await update.message.reply_text("🎰 Spinning: [ ? | ? | ? ]")
+
+    await asyncio.sleep(0.6)
+    a = random.choice(symbols); b = random.choice(symbols); c = random.choice(symbols)
+    await msg.edit_text(f"🎰 Spinning: [ {a} | ? | ? ]")
+    await asyncio.sleep(0.6)
+    await msg.edit_text(f"🎰 Spinning: [ {a} | {b} | ? ]")
+    await asyncio.sleep(0.6)
+    await msg.edit_text(f"🎰 Result:   [ {a} | {b} | {c} ]")
+
+    mult = 0
+    if a == b == c:
+        mult = 3
+    elif a == b or b == c or a == c:
+        mult = 2
+
+    if mult == 0:
+        await db.add_coins(update.effective_user.id, -bet)
+        await update.message.reply_text(f"❌ You lose: <code>-{bet}</code> coins", parse_mode=ParseMode.HTML)
+    else:
+        win = bet * mult
+        profit = win - bet
+        await db.add_coins(update.effective_user.id, profit)
+        await update.message.reply_text(f"✅ You win <b>{mult}×</b>!\nProfit: <code>+{profit}</code> coins", parse_mode=ParseMode.HTML)
+
+async def basket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    if not context.args:
+        await update.message.reply_text("အသုံးပြုပုံ: /basket <amount>")
+        return
+    try:
+        bet = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Bet amount ကို number ဖြင့်ရေးပါ။")
+        return
+    if bet <= 0:
+        await update.message.reply_text("Bet amount > 0 ဖြစ်ရပါမယ်။")
+        return
+
+    u = await db.get_user(update.effective_user.id)
+    if u["coins"] < bet:
+        await update.message.reply_text("⛔ Coins မလုံလောက်ပါ။")
+        return
+
+    msg = await update.message.reply_text("🏀 Shooting... ⛹️‍♂️")
+    await asyncio.sleep(0.9)
+    r = random.random()
+    if r < 0.12:
+        mult = 3
+        await msg.edit_text("🏀✨ SWISH! (3×)")
+    elif r < 0.40:
+        mult = 2
+        await msg.edit_text("🏀✅ Score! (2×)")
+    else:
+        mult = 0
+        await msg.edit_text("🏀❌ Miss!")
+
+    if mult == 0:
+        await db.add_coins(update.effective_user.id, -bet)
+        await update.message.reply_text(f"❌ You lose: <code>-{bet}</code> coins", parse_mode=ParseMode.HTML)
+    else:
+        win = bet * mult
+        profit = win - bet
+        await db.add_coins(update.effective_user.id, profit)
+        await update.message.reply_text(f"✅ You win <b>{mult}×</b>!\nProfit: <code>+{profit}</code> coins", parse_mode=ParseMode.HTML)
+
+async def slime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    if not require_group(update):
+        await update.message.reply_text("🟩 /slime ကို Group ထဲမှာပဲ သုံးပါ (drop ကနေ claim လုပ်ဖို့)။")
+        return
+
+    chat_id = update.effective_chat.id
+    pending = await db.get_pending_drop(chat_id)
+    if not pending:
+        await update.message.reply_text("📭 Claim လုပ်စရာ drop မရှိသေးပါ။")
+        return
+
+    if not context.args:
+        await update.message.reply_text("အသုံးပြုပုံ: /slime <character name>")
+        return
+
+    guess = clean_name(" ".join(context.args))
+    card = await db.get_card(pending["card_id"])
+    if not card:
+        await db.clear_pending_drop(chat_id)
+        await update.message.reply_text("⚠️ Drop card မတွေ့လို့ reset လုပ်လိုက်ပါတယ်။")
+        return
+
+    real = clean_name(card["name"])
+    if guess != real:
+        await update.message.reply_text("❌ Name မမှန်ပါ။ တိတိကျကျ name အမှန်ရေးပါ။")
+        return
+
+    # Claim success
+    await db.add_to_inventory(update.effective_user.id, card["id"])
+    await db.clear_pending_drop(chat_id)
+
+    # Try edit original drop message
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=pending["message_id"],
+            caption=(
+                "🎴 <b>Card Claimed!</b>\n"
+                f"{card['rarity_emoji']} <b>{card['name']}</b>\n"
+                f"🎬 <b>{card['movie']}</b>\n"
+                f"🆔 <code>{card['id']}</code>\n\n"
+                f"✅ Claimed by: {mention_html(update.effective_user)}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        # If it wasn't a photo message, ignore
+        pass
+
+    await update.message.reply_text(
+        f"✅ Congrats {mention_html(update.effective_user)}!\nYou got: {card['rarity_emoji']} <b>{card['name']}</b>  (🆔 <code>{card['id']}</code>)",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------------- Admin / Sudo Commands ----------------
+async def upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
+        return
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
+        await update.message.reply_text(
+            "အသုံးပြုပုံ:\n"
+            "1) Photo ကို reply လုပ်\n"
+            "2) /upload rarity | movie | name | price(optional)\n\n"
+            "ဥပမာ:\n"
+            "/upload Epic | One Piece | Luffy | 500"
+        )
+        return
+
+    raw = " ".join(context.args).strip()
+    parts = [p.strip() for p in raw.split("|")] if raw else []
     if len(parts) < 3:
-        await msg.reply_text("Caption format: Name | Movie | Rarity")
+        await update.message.reply_text("Format မမှန်ပါ။ /upload rarity | movie | name | price(optional)")
         return
-    name, movie, rarity = parts[0], parts[1], parts[2]
-    rarity = rarity.capitalize()
-    if rarity not in RARITY_EMOJI:
-        await msg.reply_text(f"Invalid rarity. Use one of: {', '.join(RARITY_EMOJI.keys())}")
-        return
-    photo = msg.reply_to_message.photo[-1]
-    file = await photo.get_file()
-    filename = f"{CARD_DIR}/{random.randint(100000,999999)}_{photo.file_id}.jpg"
-    await file.download_to_drive(filename)
-    cur.execute("INSERT INTO cards (name, movie, rarity, image) VALUES (?, ?, ?, ?)",
-                (name, movie, rarity, filename))
-    conn.commit()
-    await msg.reply_text(f"Card uploaded: {name} | {movie} | {rarity} {RARITY_EMOJI[rarity]}")
 
-# --- setdrop ---
-@admin_only
-async def setdrop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg.chat or msg.chat.type == "private":
-        await msg.reply_text("This command must be used in a group.")
+    rarity = parts[0]
+    movie = parts[1]
+    name = parts[2]
+    price = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else default_price_for_rarity(rarity)
+
+    photo = update.message.reply_to_message.photo[-1]
+    file_id = photo.file_id
+
+    card_id = await db.create_card(name=name, movie=movie, rarity=rarity, price=price, file_id=file_id, added_by=uid)
+    card = await db.get_card(card_id)
+
+    await update.message.reply_text(
+        "✅ <b>Card Uploaded</b>\n"
+        f"🆔 <code>{card_id}</code>\n"
+        f"{card['rarity_emoji']} <b>{card['rarity']}</b>\n"
+        f"🎬 <b>{movie}</b>\n"
+        f"👤 <b>{name}</b>\n"
+        f"💰 Price: <code>{price}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def setdrop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
+        return
+    if not require_group(update):
+        await update.message.reply_text("ဒီ command ကို Group ထဲမှာပဲ သုံးပါ။")
+        return
+    if not context.args:
+        await update.message.reply_text("အသုံးပြုပုံ: /setdrop <number>  (0=off)")
         return
     try:
         n = int(context.args[0])
-    except:
-        await msg.reply_text("Usage: /setdrop <number>")
+    except Exception:
+        await update.message.reply_text("Number ဖြင့်ရေးပါ။")
         return
-    cur.execute("INSERT OR REPLACE INTO groups (id, drop_every, msg_count) VALUES (?, ?, COALESCE((SELECT msg_count FROM groups WHERE id=?),0))",
-                (msg.chat.id, n, msg.chat.id))
-    conn.commit()
-    await msg.reply_text(f"Set drop every {n} messages in this group.")
+    if n < 0:
+        n = 0
 
-# --- message counter for drops ---
-async def group_message_counter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.chat:
-        return
-    chat = update.message.chat
-    if chat.type == "private":
-        return
-    cur.execute("SELECT * FROM groups WHERE id=?", (chat.id,))
-    g = cur.fetchone()
-    if not g:
-        return
-    drop_every = g["drop_every"]
-    if drop_every <= 0:
-        return
-    msg_count = g["msg_count"] + 1
-    if msg_count >= drop_every:
-        # trigger drop
-        # pick random card
-        cur.execute("SELECT * FROM cards ORDER BY RANDOM() LIMIT 1")
-        card = cur.fetchone()
-        if card:
-            # create drop with hidden answer
-            cur.execute("INSERT INTO drops (group_id, card_id, claimed, answer) VALUES (?, ?, 0, ?)",
-                        (chat.id, card["id"], card["name"].lower()))
-            conn.commit()
-            await context.bot.send_message(chat.id, "📢 A mysterious card has dropped! Guess its character name and claim with /slime <name>")
-        msg_count = 0
-    cur.execute("UPDATE groups SET msg_count=? WHERE id=?", (msg_count, chat.id))
-    conn.commit()
+    chat_id = update.effective_chat.id
+    await db.ensure_chat(chat_id, DEFAULT_DROP_EVERY)
+    await db.set_drop_every(chat_id, n)
+    await db.reset_msg_count(chat_id)
+    await update.message.reply_text(f"✅ Drop set: <b>{n}</b> messages (0=off)", parse_mode=ParseMode.HTML)
 
-# --- slime (claim) ---
-async def slime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /slime <character name>")
-        return
-    guess = " ".join(args).strip().lower()
-    # find latest unclaimed drop in this chat (or global if private)
-    chat_id = update.message.chat.id if update.message.chat else None
-    cur.execute("SELECT * FROM drops WHERE group_id=? AND claimed=0 ORDER BY id DESC LIMIT 1", (chat_id,))
-    drop = cur.fetchone()
-    if not drop:
-        await update.message.reply_text("No active drop to claim.")
-        return
-    if guess == drop["answer"]:
-        # give card to user
-        cur.execute("SELECT * FROM cards WHERE id=?", (drop["card_id"],))
-        card = cur.fetchone()
-        # add to user_cards
-        cur.execute("SELECT id FROM users WHERE tg_id=?", (user.id,))
-        u = cur.fetchone()
-        cur.execute("INSERT INTO user_cards (user_id, card_id) VALUES (?, ?)", (u["id"], card["id"]))
-        cur.execute("UPDATE drops SET claimed=1 WHERE id=?", (drop["id"],))
-        conn.commit()
-        await update.message.reply_text(f"Congratulations! You claimed **{card['name']}** {RARITY_EMOJI.get(card['rarity'],'')} and added to your /harem", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Wrong name. Try again!")
+async def gift_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
 
-# --- harem (collection) with pagination ---
-CARDS_PER_PAGE = 5
-
-async def harem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = ensure_user(user)
-    cur.execute("""
-        SELECT uc.id as ucid, c.id as cid, c.name, c.movie, c.rarity, c.image, uc.is_fav
-        FROM user_cards uc
-        JOIN cards c ON uc.card_id=c.id
-        JOIN users u ON uc.user_id=u.id
-        WHERE u.tg_id=?
-        ORDER BY uc.id DESC
-    """, (user.id,))
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("Your harem is empty. Try /shop or wait for drops.")
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
         return
-    # pagination
-    page = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
-    total = len(rows)
-    pages = (total + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
-    start = (page-1)*CARDS_PER_PAGE
-    end = start + CARDS_PER_PAGE
-    chunk = rows[start:end]
-    text_lines = []
-    for r in chunk:
-        # count owned duplicates
-        cur.execute("SELECT COUNT(*) as cnt FROM user_cards WHERE user_id=(SELECT id FROM users WHERE tg_id=?) AND card_id=?", (user.id, r["cid"]))
-        cnt = cur.fetchone()["cnt"]
-        text_lines.append(f"**{r['movie']}** — {r['name']} {RARITY_EMOJI.get(r['rarity'],'')}\nown:[{cnt}/25]  CardID:{r['cid']}  fav:{'⭐' if r['is_fav'] else ''}")
-    text = "\n\n".join(text_lines)
-    kb = []
-    if page > 1:
-        kb.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"harem_page_{page-1}"))
-    if page < pages:
-        kb.append(InlineKeyboardButton("Next ➡️", callback_data=f"harem_page_{page+1}"))
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([kb]) if kb else None)
 
-async def harem_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if not data.startswith("harem_page_"):
+    if len(context.args) < 3:
+        await update.message.reply_text("အသုံးပြုပုံ:\n/gift coin <amount> <reply or id>\n/gift card <amount> <reply or id>")
         return
-    page = int(data.split("_")[-1])
-    # emulate /harem page
-    user = q.from_user
-    cur.execute("""
-        SELECT uc.id as ucid, c.id as cid, c.name, c.movie, c.rarity, c.image, uc.is_fav
-        FROM user_cards uc
-        JOIN cards c ON uc.card_id=c.id
-        JOIN users u ON uc.user_id=u.id
-        WHERE u.tg_id=?
-        ORDER BY uc.id DESC
-    """, (user.id,))
-    rows = cur.fetchall()
-    total = len(rows)
-    pages = (total + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
-    start = (page-1)*CARDS_PER_PAGE
-    end = start + CARDS_PER_PAGE
-    chunk = rows[start:end]
-    text_lines = []
-    for r in chunk:
-        cur.execute("SELECT COUNT(*) as cnt FROM user_cards WHERE user_id=(SELECT id FROM users WHERE tg_id=?) AND card_id=?", (user.id, r["cid"]))
-        cnt = cur.fetchone()["cnt"]
-        text_lines.append(f"**{r['movie']}** — {r['name']} {RARITY_EMOJI.get(r['rarity'],'')}\nown:[{cnt}/25]  CardID:{r['cid']}  fav:{'⭐' if r['is_fav'] else ''}")
-    text = "\n\n".join(text_lines)
-    kb = []
-    if page > 1:
-        kb.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"harem_page_{page-1}"))
-    if page < pages:
-        kb.append(InlineKeyboardButton("Next ➡️", callback_data=f"harem_page_{page+1}"))
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([kb]) if kb else None)
 
-# --- set favorite ---
-async def setfav(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-    if not context.args:
-        await update.message.reply_text("Usage: /set <card id>")
-        return
+    kind = context.args[0].lower()
     try:
-        cid = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid card id.")
+        amount = int(context.args[1])
+    except Exception:
+        await update.message.reply_text("Amount ကို number ဖြင့်ရေးပါ။")
         return
-    cur.execute("SELECT id FROM users WHERE tg_id=?", (user.id,))
-    u = cur.fetchone()
-    # unset previous fav
-    cur.execute("UPDATE user_cards SET is_fav=0 WHERE user_id=?", (u["id"],))
-    # set fav if user has that card
-    cur.execute("SELECT uc.id FROM user_cards uc JOIN cards c ON uc.card_id=c.id WHERE uc.user_id=? AND c.id=?", (u["id"], cid))
-    row = cur.fetchone()
-    if not row:
-        await update.message.reply_text("You don't own that card.")
-        return
-    cur.execute("UPDATE user_cards SET is_fav=1 WHERE id=?", (row["id"],))
-    conn.commit()
-    await update.message.reply_text("Favorite set.")
 
-# --- slots game ---
-async def slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = ensure_user(user)
-    if not context.args:
-        await update.message.reply_text("Usage: /slots <amount>")
-        return
-    try:
-        amt = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid amount.")
-        return
-    if amt <= 0:
-        await update.message.reply_text("Amount must be positive.")
-        return
-    if u["coins"] < amt:
-        await update.message.reply_text("Not enough coins.")
-        return
-    # play
-    symbols = ["🍒","🍋","🔔","⭐","7️⃣"]
-    res = [random.choice(symbols) for _ in range(3)]
-    text = " | ".join(res)
-    # determine win
-    if res[0]==res[1]==res[2]:
-        multiplier = 3
-        win = amt * multiplier
-        new_coins = u["coins"] + win
-        cur.execute("UPDATE users SET coins=? WHERE tg_id=?", (new_coins, user.id))
-        conn.commit()
-        await update.message.reply_text(f"{text}\nJackpot! You won {win} coins. New balance: {new_coins}")
-    elif res[0]==res[1] or res[1]==res[2] or res[0]==res[2]:
-        multiplier = 2
-        win = amt * multiplier
-        new_coins = u["coins"] + win
-        cur.execute("UPDATE users SET coins=? WHERE tg_id=?", (new_coins, user.id))
-        conn.commit()
-        await update.message.reply_text(f"{text}\nNice! You won {win} coins. New balance: {new_coins}")
-    else:
-        new_coins = u["coins"] - amt
-        cur.execute("UPDATE users SET coins=? WHERE tg_id=?", (new_coins, user.id))
-        conn.commit()
-        await update.message.reply_text(f"{text}\nYou lost {amt} coins. New balance: {new_coins}")
-
-# --- basket game ---
-async def basket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = ensure_user(user)
-    if not context.args:
-        await update.message.reply_text("Usage: /basket <amount>")
-        return
-    try:
-        amt = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid amount.")
-        return
-    if amt <= 0:
-        await update.message.reply_text("Amount must be positive.")
-        return
-    if u["coins"] < amt:
-        await update.message.reply_text("Not enough coins.")
-        return
-    # 50% chance to score; if score -> 2x or 3x randomly
-    scored = random.random() < 0.5
-    if scored:
-        mult = random.choice([2,3])
-        win = amt * mult
-        new_coins = u["coins"] + win
-        cur.execute("UPDATE users SET coins=? WHERE tg_id=?", (new_coins, user.id))
-        conn.commit()
-        await update.message.reply_text(f"🏀 You scored! Multiplier {mult}x. You won {win} coins. New balance: {new_coins}")
-    else:
-        new_coins = u["coins"] - amt
-        cur.execute("UPDATE users SET coins=? WHERE tg_id=?", (new_coins, user.id))
-        conn.commit()
-        await update.message.reply_text(f"Missed! You lost {amt} coins. New balance: {new_coins}")
-
-# --- givecoin ---
-async def givecoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = ensure_user(user)
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /givecoin <reply or id> <amount>")
-        return
-    target = context.args[0]
-    try:
-        amt = int(context.args[1])
-    except:
-        await update.message.reply_text("Invalid amount.")
-        return
-    if amt <= 0:
-        await update.message.reply_text("Amount must be positive.")
-        return
-    # determine target id
+    # target user
+    target_id = None
     if update.message.reply_to_message:
-        tgt = update.message.reply_to_message.from_user
-        tgt_id = tgt.id
+        target_id = update.message.reply_to_message.from_user.id
     else:
         try:
-            tgt_id = int(target)
-        except:
-            await update.message.reply_text("Invalid target id.")
+            target_id = int(context.args[2])
+        except Exception:
+            await update.message.reply_text("Target ကို reply သို့မဟုတ် id ဖြင့်ပေးပါ။")
             return
-    if u["coins"] < amt:
-        await update.message.reply_text("Not enough coins.")
-        return
-    # transfer
-    cur.execute("UPDATE users SET coins=coins-? WHERE tg_id=?", (amt, user.id))
-    cur.execute("INSERT OR IGNORE INTO users (tg_id, username, coins) VALUES (?, ?, ?)", (tgt_id, "", 10000))
-    cur.execute("UPDATE users SET coins=coins+? WHERE tg_id=?", (amt, tgt_id))
-    conn.commit()
-    await update.message.reply_text(f"Sent {amt} coins to {tgt_id}.")
 
-# --- balance ---
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = ensure_user(user)
-    await update.message.reply_text(f"Your balance: {u['coins']} coins")
+    await db.upsert_user(target_id, "", "User", START_COINS)
 
-# --- daily ---
-async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = ensure_user(user)
-    # simple daily cooldown by day number
-    from datetime import datetime
-    today = int(datetime.utcnow().strftime("%Y%m%d"))
-    if u["daily_claimed"] == today:
-        await update.message.reply_text("You've already claimed today's bonus.")
-        return
-    bonus = random.randint(5000,50000)
-    cur.execute("UPDATE users SET coins=coins+?, daily_claimed=? WHERE tg_id=?", (bonus, today, user.id))
-    conn.commit()
-    await update.message.reply_text(f"You received daily bonus: {bonus} coins. Enjoy!")
-
-# --- shop (browse cards and buy) ---
-async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # show one card at a time with price
-    cur.execute("SELECT * FROM cards ORDER BY id ASC")
-    cards = cur.fetchall()
-    if not cards:
-        await update.message.reply_text("Shop is empty.")
-        return
-    # store index in user context
-    context.user_data['shop_index'] = 0
-    await show_shop_card(update, context)
-
-async def show_shop_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx = context.user_data.get('shop_index',0)
-    cur.execute("SELECT * FROM cards ORDER BY id ASC")
-    cards = cur.fetchall()
-    if not cards:
-        await update.message.reply_text("Shop empty.")
-        return
-    card = cards[idx % len(cards)]
-    # price based on rarity
-    base_price = {"Common":1000,"Rare":5000,"Epic":15000,"Legendary":50000,"Mythic":150000}
-    price = base_price.get(card["rarity"],2000)
-    text = f"**{card['name']}**\nMovie: {card['movie']}\nRarity: {card['rarity']} {RARITY_EMOJI.get(card['rarity'],'')}\nPrice: {price} coins\nCardID: {card['id']}"
-    kb = [
-        [InlineKeyboardButton("Buy", callback_data=f"shop_buy_{card['id']}_{price}"),
-         InlineKeyboardButton("Next", callback_data="shop_next")]
-    ]
-    # send photo if exists
-    if card["image"] and os.path.exists(card["image"]):
-        await update.message.reply_photo(open(card["image"],"rb"), caption=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
-
-async def shop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    user = q.from_user
-    ensure_user(user)
-    if data == "shop_next":
-        context.user_data['shop_index'] = context.user_data.get('shop_index',0) + 1
-        # edit message to next card
-        # simply call show_shop_card by sending new message
-        await show_shop_card(q, context)
-        try:
-            await q.message.delete()
-        except:
-            pass
-        return
-    if data.startswith("shop_buy_"):
-        parts = data.split("_")
-        cid = int(parts[2])
-        price = int(parts[3])
-        cur.execute("SELECT coins FROM users WHERE tg_id=?", (user.id,))
-        coins = cur.fetchone()["coins"]
-        if coins < price:
-            await q.message.reply_text("Not enough coins.")
+    if kind == "coin":
+        if amount <= 0:
+            await update.message.reply_text("Amount > 0 ဖြစ်ရပါမယ်။")
             return
-        # give card
-        cur.execute("INSERT INTO user_cards (user_id, card_id) VALUES ((SELECT id FROM users WHERE tg_id=?), ?)", (user.id, cid))
-        cur.execute("UPDATE users SET coins=coins-? WHERE tg_id=?", (price, user.id))
-        conn.commit()
-        await q.message.reply_text("Purchased and added to your /harem!")
-
-# --- tops ---
-async def tops(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("Top Coins", callback_data="tops_coins"),
-         InlineKeyboardButton("Top Cards", callback_data="tops_cards")]
-    ]
-    await update.message.reply_text("Choose leaderboard:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def tops_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "tops_coins":
-        cur.execute("SELECT tg_id, username, coins FROM users ORDER BY coins DESC LIMIT 10")
-        rows = cur.fetchall()
-        text = "Top Coins:\n"
-        for i,r in enumerate(rows,1):
-            text += f"{i}. {r['username'] or r['tg_id']} — {r['coins']}\n"
-        await q.edit_message_text(text)
-    else:
-        cur.execute("""
-            SELECT u.tg_id, u.username, COUNT(uc.id) as cnt
-            FROM users u
-            LEFT JOIN user_cards uc ON uc.user_id=u.id
-            GROUP BY u.id
-            ORDER BY cnt DESC LIMIT 10
-        """)
-        rows = cur.fetchall()
-        text = "Top Collections:\n"
-        for i,r in enumerate(rows,1):
-            text += f"{i}. {r['username'] or r['tg_id']} — {r['cnt']} cards\n"
-        await q.edit_message_text(text)
-
-# --- admin gift coin/card ---
-@admin_only
-async def gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /gift coin <amount> <reply or id>
-    msg = update.message
-    args = context.args
-    if len(args) < 3:
-        await msg.reply_text("Usage: /gift coin|card <amount> <reply or id>")
+        await db.add_coins(target_id, amount)
+        await update.message.reply_text(f"✅ Gifted <code>+{amount}</code> coins to <code>{target_id}</code>", parse_mode=ParseMode.HTML)
         return
-    typ = args[0].lower()
-    try:
-        amt = int(args[1])
-    except:
-        await msg.reply_text("Invalid amount.")
-        return
-    # target
-    if msg.reply_to_message:
-        tgt = msg.reply_to_message.from_user
-        tgt_id = tgt.id
-    else:
-        try:
-            tgt_id = int(args[2])
-        except:
-            await msg.reply_text("Invalid target id.")
+
+    if kind == "card":
+        if amount <= 0:
+            await update.message.reply_text("Amount > 0 ဖြစ်ရပါမယ်။")
             return
-    cur.execute("INSERT OR IGNORE INTO users (tg_id, username, coins) VALUES (?, ?, ?)", (tgt_id, "", 10000))
-    if typ == "coin":
-        cur.execute("UPDATE users SET coins=coins+? WHERE tg_id=?", (amt, tgt_id))
-        conn.commit()
-        await msg.reply_text(f"Gave {amt} coins to {tgt_id}.")
-    elif typ == "card":
-        # give random cards
-        cur.execute("SELECT id FROM cards ORDER BY RANDOM() LIMIT ?", (amt,))
-        picks = cur.fetchall()
-        for p in picks:
-            cur.execute("INSERT INTO user_cards (user_id, card_id) VALUES ((SELECT id FROM users WHERE tg_id=?), ?)", (tgt_id, p["id"]))
-        conn.commit()
-        await msg.reply_text(f"Gave {amt} random cards to {tgt_id}.")
-    else:
-        await msg.reply_text("Invalid type. Use coin or card.")
+        got = 0
+        for _ in range(amount):
+            c = await db.random_card()
+            if not c:
+                break
+            await db.add_to_inventory(target_id, c["id"])
+            got += 1
+        await update.message.reply_text(f"✅ Gifted <b>{got}</b> random cards to <code>{target_id}</code>", parse_mode=ParseMode.HTML)
+        return
 
-# --- edit (admin commands list) ---
-@admin_only
-async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "Admin commands: /upload, /setdrop, /gift, /broadcast, /stats, /backup, /restore, /allclear, /delete, /addsudo, /sudolist, /evote"
-    await update.message.reply_text(text)
+    await update.message.reply_text("Kind မမှန်ပါ။ coin / card ထဲကတစ်ခုကိုသုံးပါ။")
 
-# --- broadcast ---
-@admin_only
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    # send to all groups in groups table
-    cur.execute("SELECT id FROM groups")
-    groups = cur.fetchall()
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
+        return
+    s = await db.stats()
+    await update.message.reply_text(
+        "📊 <b>Stats</b>\n"
+        f"👤 Users: <code>{s['users']}</code>\n"
+        f"👥 Groups: <code>{s['groups']}</code>\n"
+        f"🎴 Cards: <code>{s['cards']}</code>\n"
+        f"🗂️ Inventory rows: <code>{s['inventory']}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    groups = await db.list_groups()
     if not groups:
-        await msg.reply_text("No groups registered.")
+        await update.message.reply_text("Group list မရှိသေးပါ။")
         return
-    # message to send: if reply, use that content
-    if msg.reply_to_message:
-        for g in groups:
-            try:
-                if msg.reply_to_message.photo:
-                    await context.bot.send_photo(g["id"], msg.reply_to_message.photo[-1].file_id, caption=msg.reply_to_message.caption or "")
-                else:
-                    await context.bot.send_message(g["id"], msg.reply_to_message.text or "")
-            except Exception as e:
-                logger.warning(f"Broadcast to {g['id']} failed: {e}")
-        await msg.reply_text("Broadcast sent.")
+
+    src = update.message.reply_to_message if update.message.reply_to_message else update.message
+    text = None
+    photo_file_id = None
+
+    if src.photo:
+        photo_file_id = src.photo[-1].file_id
+        text = src.caption or (" ".join(context.args) if context.args else "")
     else:
-        await msg.reply_text("Reply to a message (text or photo) to broadcast.")
+        text = " ".join(context.args).strip()
 
-# --- stats ---
-@admin_only
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur.execute("SELECT COUNT(*) as c FROM users")
-    users = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) as c FROM groups")
-    groups = cur.fetchone()["c"]
-    await update.message.reply_text(f"Users: {users}\nGroups: {groups}")
+    if not photo_file_id and not text:
+        await update.message.reply_text("အသုံးပြုပုံ:\n/broadcast your text\nသို့မဟုတ်\ntext/photo ကို reply လုပ်ပြီး /broadcast")
+        return
 
-# --- backup (export DB file) ---
-@admin_only
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok = 0
+    fail = 0
+    for gid in groups:
+        try:
+            if photo_file_id:
+                await context.bot.send_photo(chat_id=gid, photo=photo_file_id, caption=text or "", parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=gid, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+
+    await update.message.reply_text(f"📣 Broadcast done.\n✅ Sent: {ok}\n⚠️ Failed: {fail}")
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    os.makedirs("./data", exist_ok=True)
+    os.makedirs("./backups", exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out = f"./backups/bot_backup_{stamp}.sqlite3"
+
+    # safe-ish online backup using VACUUM INTO (needs modern sqlite)
     try:
-        await update.message.reply_document(open(DB_PATH,"rb"))
-    except Exception as e:
-        await update.message.reply_text("Backup failed.")
+        await db.conn.execute(f"VACUUM INTO '{out}'")
+        await db.conn.commit()
+    except Exception:
+        # fallback to file copy
+        await db.conn.commit()
+        shutil.copyfile(DB_PATH, out)
 
-# --- allclear ---
-@admin_only
-async def allclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur.executescript("""
-    DELETE FROM user_cards;
-    DELETE FROM users;
-    DELETE FROM drops;
-    """)
-    conn.commit()
-    await update.message.reply_text("All user data cleared.")
+    await update.message.reply_document(document=open(out, "rb"), filename=os.path.basename(out), caption="💾 DB Backup")
 
-# --- delete card ---
-@admin_only
-async def delete_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        await update.message.reply_text("Restore လုပ်ရန် backup file ကို reply လုပ်ပြီး /restore ပြုလုပ်ပါ။")
+        return
+
+    doc = update.message.reply_to_message.document
+    file = await context.bot.get_file(doc.file_id)
+
+    tmp = "./data/restore_tmp.sqlite3"
+    await file.download_to_drive(custom_path=tmp)
+
+    # swap DB
+    await db.close()
+    shutil.copyfile(tmp, DB_PATH)
+    await db.connect()
+    await db.init_schema()
+    await update.message.reply_text("♻️ Restore complete. ✅")
+
+async def allclear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    await db.close()
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    await db.connect()
+    await db.init_schema()
+    await update.message.reply_text("🧨 All data cleared. DB re-initialized.")
+
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
+        return
     if not context.args:
-        await update.message.reply_text("Usage: /delete <card id>")
+        await update.message.reply_text("အသုံးပြုပုံ: /delete <card id>")
         return
     try:
-        cid = int(context.args[0])
-    except:
-        await update.message.reply_text("Invalid id.")
+        card_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Card ID ကို number ဖြင့်ရေးပါ။")
         return
-    cur.execute("DELETE FROM cards WHERE id=?", (cid,))
-    cur.execute("DELETE FROM user_cards WHERE card_id=?", (cid,))
-    conn.commit()
-    await update.message.reply_text("Card deleted.")
+    ok = await db.delete_card(card_id)
+    await update.message.reply_text("✅ Deleted." if ok else "⚠️ Card ID မတွေ့ပါ။")
 
-# --- addsudo / sudolist ---
-@admin_only
-async def addsudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addsudo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    target_id = None
     if update.message.reply_to_message:
-        tgt = update.message.reply_to_message.from_user
-        tg_id = tgt.id
+        target_id = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            tg_id = int(context.args[0])
-        except:
-            await update.message.reply_text("Invalid id.")
+            target_id = int(context.args[0])
+        except Exception:
+            target_id = None
+
+    if not target_id:
+        await update.message.reply_text("အသုံးပြုပုံ: /addsudo <reply or id>")
+        return
+
+    await db.add_sudo(target_id)
+    await update.message.reply_text(f"✅ Sudo added: <code>{target_id}</code>", parse_mode=ParseMode.HTML)
+
+async def sudolist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    ids = await db.sudo_list()
+    if not ids:
+        await update.message.reply_text("📜 Sudo list: (empty)")
+        return
+    text = "📜 <b>Sudo list</b>\n" + "\n".join([f"• <code>{i}</code>" for i in ids])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def evote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+
+    uid = update.effective_user.id
+    if not (await is_sudo_or_admin(uid)):
+        await update.message.reply_text("⛔ Admin/Sudo မဟုတ်ပါ။")
+        return
+    if not require_group(update):
+        await update.message.reply_text("ဒီ command ကို Group ထဲမှာပဲ သုံးပါ။")
+        return
+
+    raw = " ".join(context.args).strip()
+    names = [x.strip() for x in raw.split("|") if x.strip()]
+    if len(names) < 2:
+        await update.message.reply_text("အသုံးပြုပုံ: /evote name1 | name2 | name3")
+        return
+
+    await db.set_vote(update.effective_chat.id, names)
+    opts = await db.get_vote_options(update.effective_chat.id)
+    await update.message.reply_text("🗳️ Vote options set ✅\n/vote ဖြင့် မဲပေးနိုင်ပါပြီ။", reply_markup=vote_keyboard(opts))
+
+async def vote_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update)
+    await ensure_group_known(update)
+    if not require_group(update):
+        await update.message.reply_text("ဒီ command ကို Group ထဲမှာပဲ သုံးပါ။")
+        return
+    opts = await db.get_vote_options(update.effective_chat.id)
+    if not opts:
+        await update.message.reply_text("🗳️ Vote မစတင်သေးပါ။ Admin က /evote ဖြင့် options ထည့်ပါ။")
+        return
+    await update.message.reply_text("🗳️ မဲပေးရန် button ကိုနှိပ်ပါ:", reply_markup=vote_keyboard(opts))
+
+
+# ---------------- Callback handlers ----------------
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    if data == "noop":
+        return
+
+    if data.startswith("harem:"):
+        await db.upsert_user(user_id, query.from_user.username or "", query.from_user.first_name or "", START_COINS)
+        total_cards = await db.count_distinct_cards()
+        page = int(data.split(":")[1])
+        cards, pages = await db.inventory_page(user_id, page, page_size=5)
+        if not cards:
+            await query.edit_message_text("📭 Harem kosong ပါသေးတယ်။")
             return
+        lines = [f"🗂️ <b>{mention_html(query.from_user)}'s Harem</b>\n"]
+        for idx, c in enumerate(cards, start=1):
+            lines.append(fmt_card_line(c, idx, total_cards))
+            lines.append("")
+        await query.edit_message_text(
+            "\n".join(lines).strip(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=harem_keyboard(page, pages),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("tops:"):
+        mode = data.split(":")[1]
+        if mode == "coins":
+            top = await db.top_coins(10)
+            lines = ["🏆 <b>Top 10 — Coins</b>\n"]
+            for i, r in enumerate(top, start=1):
+                name = r["username"] or r["first_name"] or str(r["user_id"])
+                lines.append(f"{i:02d}. <b>{name}</b> — <code>{r['coins']}</code> 🪙")
+            await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=tops_keyboard("coins"))
+        else:
+            top = await db.top_cards(10)
+            lines = ["🏆 <b>Top 10 — Cards</b>\n"]
+            for i, r in enumerate(top, start=1):
+                name = r["username"] or r["first_name"] or str(r["user_id"])
+                lines.append(f"{i:02d}. <b>{name}</b> — <code>{r['cnt']}</code> 🃏")
+            await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=tops_keyboard("cards"))
+        return
+
+    if data == "shop:next":
+        await db.upsert_user(user_id, query.from_user.username or "", query.from_user.first_name or "", START_COINS)
+        card = await db.random_shop_card()
+        if not card:
+            await query.edit_message_text("🛍️ Shop empty.")
+            return
+        SHOP_STATE[user_id] = card["id"]
+        txt = (
+            "🛍️ <b>Shop</b>\n\n"
+            f"🎬 <b>{card['movie']}</b>\n"
+            f"🆔 <code>{card['id']}</code>\n"
+            f"{card['rarity_emoji']} <b>{card['rarity']}</b>\n"
+            f"👤 <b>{card['name']}</b>\n\n"
+            f"💰 Price: <code>{card['price']}</code> coins"
+        )
+        # If photo caption exists, edit caption; else edit text
+        try:
+            await query.edit_message_caption(caption=txt, parse_mode=ParseMode.HTML, reply_markup=shop_keyboard(card["id"]))
+        except Exception:
+            await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=shop_keyboard(card["id"]))
+        return
+
+    if data.startswith("shop:buy:"):
+        await db.upsert_user(user_id, query.from_user.username or "", query.from_user.first_name or "", START_COINS)
+        card_id = int(data.split(":")[2])
+        card = await db.get_card(card_id)
+        if not card:
+            await query.answer("Card not found", show_alert=True)
+            return
+        u = await db.get_user(user_id)
+        if u["coins"] < card["price"]:
+            await query.answer("Coins မလုံလောက်ပါ!", show_alert=True)
+            return
+        await db.add_coins(user_id, -card["price"])
+        await db.add_to_inventory(user_id, card_id)
+        await query.answer("Purchased ✅", show_alert=False)
+
+        new_text = (
+            "✅ <b>Purchased!</b>\n"
+            f"{card['rarity_emoji']} <b>{card['name']}</b>\n"
+            f"🎬 <b>{card['movie']}</b>\n"
+            f"🆔 <code>{card['id']}</code>\n"
+            f"💰 Paid: <code>{card['price']}</code>\n\n"
+            "Next နှိပ်ပြီး ဆက်ကြည့်နိုင်ပါတယ်။"
+        )
+        try:
+            await query.edit_message_caption(caption=new_text, parse_mode=ParseMode.HTML, reply_markup=shop_keyboard(card_id))
+        except Exception:
+            await query.edit_message_text(new_text, parse_mode=ParseMode.HTML, reply_markup=shop_keyboard(card_id))
+        return
+
+    if data.startswith("vote:"):
+        if not (query.message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)):
+            await query.answer("Vote is for groups only.", show_alert=True)
+            return
+
+        action = data.split(":")[1]
+        opts = await db.get_vote_options(chat_id)
+        if not opts:
+            await query.answer("Vote not set", show_alert=True)
+            return
+
+        if action == "results":
+            txt = await render_vote_status(chat_id, user_id)
+            await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=vote_keyboard(opts))
+            return
+
+        # option id
+        try:
+            option_id = int(action)
+        except Exception:
+            return
+
+        valid_ids = {o["option_id"] for o in opts}
+        if option_id not in valid_ids:
+            await query.answer("Invalid option", show_alert=True)
+            return
+
+        await db.cast_vote(chat_id, user_id, option_id)
+        txt = await render_vote_status(chat_id, user_id)
+        await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=vote_keyboard(opts))
+        return
+
+
+# ---------------- Drop System (message counter) ----------------
+async def group_message_counter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not update.message or update.message.from_user.is_bot:
+        return
+
+    await ensure_group_known(update)
+    await db.ensure_chat(update.effective_chat.id, DEFAULT_DROP_EVERY)
+
+    drop_every = await db.get_drop_every(update.effective_chat.id)
+    if drop_every <= 0:
+        return
+
+    pending = await db.get_pending_drop(update.effective_chat.id)
+    if pending:
+        # one pending at a time
+        return
+
+    count = await db.inc_msg_count(update.effective_chat.id)
+    if count < drop_every:
+        return
+
+    await db.reset_msg_count(update.effective_chat.id)
+
+    card = await db.random_card()
+    if not card:
+        # no cards uploaded yet
+        return
+
+    name = card["name"]
+    hint = f"{name[:1]}{'•' * max(0, len(name)-2)}{name[-1:]}" if len(name) >= 2 else name[:1]
+
+    caption = (
+        "🎴 <b>Card Dropped!</b>\n"
+        f"🎬 <b>{card['movie']}</b>\n"
+        f"🆔 <code>{card['id']}</code>\n"
+        f"{card['rarity_emoji']} <b>{card['rarity']}</b>\n"
+        f"❓ Name: <b>{hint}</b>\n\n"
+        "🟩 Claim: <code>/slime Character Name</code>\n"
+        "(name အမှန်တိတိကျကျရေးပါ)"
+    )
+
+    if card.get("file_id"):
+        m = await update.message.reply_photo(photo=card["file_id"], caption=caption, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("Reply to user or provide id.")
-        return
-    cur.execute("INSERT OR IGNORE INTO sudo_list (tg_id) VALUES (?)", (tg_id,))
-    conn.commit()
-    await update.message.reply_text(f"Added sudo: {tg_id}")
+        m = await update.message.reply_text(caption, parse_mode=ParseMode.HTML)
 
-@admin_only
-async def sudolist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cur.execute("SELECT tg_id FROM sudo_list")
-    rows = cur.fetchall()
-    text = "Sudo list:\n" + "\n".join(str(r["tg_id"]) for r in rows) if rows else "Empty"
-    await update.message.reply_text(text)
+    await db.set_pending_drop(update.effective_chat.id, card["id"], m.message_id)
 
-# --- evote / vote ---
-@admin_only
-async def evote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Usage: /evote name1 | name2 | name3 (in group)
-    if not update.message.chat or update.message.chat.type == "private":
-        await update.message.reply_text("Use in group.")
-        return
-    caption = " ".join(context.args)
-    if not caption:
-        await update.message.reply_text("Usage: /evote name1 | name2 | ...")
-        return
-    names = [n.strip() for n in " ".join(context.args).split("|") if n.strip()]
-    if not names:
-        await update.message.reply_text("No names provided.")
-        return
-    # clear previous evotes for group
-    cur.execute("DELETE FROM evotes WHERE group_id=?", (update.message.chat.id,))
-    for n in names:
-        cur.execute("INSERT INTO evotes (group_id, name, votes) VALUES (?, ?, 0)", (update.message.chat.id, n))
-    conn.commit()
-    # build buttons
-    cur.execute("SELECT id, name FROM evotes WHERE group_id=?", (update.message.chat.id,))
-    rows = cur.fetchall()
-    kb = [[InlineKeyboardButton(r["name"], callback_data=f"vote_{r['id']}")] for r in rows]
-    await update.message.reply_text("Vote now:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def vote_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if not data.startswith("vote_"):
-        return
-    vid = int(data.split("_")[1])
-    # increment vote
-    cur.execute("UPDATE evotes SET votes=votes+1 WHERE id=?", (vid,))
-    conn.commit()
-    cur.execute("SELECT name, votes FROM evotes WHERE id=?", (vid,))
-    r = cur.fetchone()
-    await q.edit_message_text(f"Voted for {r['name']} — total votes: {r['votes']}")
+# ---------------- Main ----------------
+async def on_startup(app: Application):
+    await db.connect()
+    await db.init_schema()
+    log.info("DB ready")
 
-# --- message handler for registering groups ---
-async def register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat and update.message.chat.type != "private":
-        cur.execute("INSERT OR IGNORE INTO groups (id, drop_every, msg_count) VALUES (?, 0, 0)", (update.message.chat.id,))
-        conn.commit()
-
-# --- main ---
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    # user commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("helps", helps))
-    app.add_handler(CommandHandler("slime", slime))
-    app.add_handler(CommandHandler("harem", harem))
-    app.add_handler(CallbackQueryHandler(harem_page_cb, pattern=r"^harem_page_"))
-    app.add_handler(CommandHandler("set", setfav))
-    app.add_handler(CommandHandler("slots", slots))
-    app.add_handler(CommandHandler("basket", basket))
-    app.add_handler(CommandHandler("givecoin", givecoin))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("daily", daily))
-    app.add_handler(CommandHandler("shop", shop))
-    app.add_handler(CallbackQueryHandler(shop_cb, pattern=r"^shop_"))
-    app.add_handler(CommandHandler("tops", tops))
-    app.add_handler(CallbackQueryHandler(tops_cb, pattern=r"^tops_"))
-    app.add_handler(CommandHandler("upload", upload))
-    app.add_handler(CommandHandler("setdrop", setdrop))
-    app.add_handler(CommandHandler("gift", gift))
-    app.add_handler(CommandHandler("edit", edit))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("backup", backup))
-    app.add_handler(CommandHandler("allclear", allclear))
-    app.add_handler(CommandHandler("delete", delete_card))
-    app.add_handler(CommandHandler("addsudo", addsudo))
-    app.add_handler(CommandHandler("sudolist", sudolist))
-    app.add_handler(CommandHandler("evote", evote))
-    app.add_handler(CallbackQueryHandler(vote_cb, pattern=r"^vote_"))
+    # User
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("helps", helps_cmd))
+    app.add_handler(CommandHandler("edit", edit_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("daily", daily_cmd))
+    app.add_handler(CommandHandler("givecoin", givecoin_cmd))
+    app.add_handler(CommandHandler("set", set_cmd))
+    app.add_handler(CommandHandler("harem", harem_cmd))
+    app.add_handler(CommandHandler("shop", shop_cmd))
+    app.add_handler(CommandHandler("tops", tops_cmd))
+    app.add_handler(CommandHandler("slots", slots_cmd))
+    app.add_handler(CommandHandler("basket", basket_cmd))
+    app.add_handler(CommandHandler("slime", slime_cmd))
 
-    # group message counter and register
-    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), group_message_counter))
-    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), register_group))
+    # Admin/Sudo
+    app.add_handler(CommandHandler("upload", upload_cmd))
+    app.add_handler(CommandHandler("setdrop", setdrop_cmd))
+    app.add_handler(CommandHandler("gift", gift_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(CommandHandler("allclear", allclear_cmd))
+    app.add_handler(CommandHandler("delete", delete_cmd))
+    app.add_handler(CommandHandler("addsudo", addsudo_cmd))
+    app.add_handler(CommandHandler("sudolist", sudolist_cmd))
+    app.add_handler(CommandHandler("evote", evote_cmd))
+    app.add_handler(CommandHandler("vote", vote_cmd))
 
-    # shop navigation callback already added
-    # start
-    logger.info("Bot starting...")
-    app.run_polling()
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(callbacks))
+
+    # Group message counter (drops)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (~filters.COMMAND), group_message_counter))
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
